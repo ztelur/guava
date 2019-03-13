@@ -348,12 +348,40 @@ abstract class SmoothRateLimiter extends RateLimiter {
     return nextFreeTicketMicros;
   }
 
+
+  /**
+   * 在同步块中操作，每次只能有一个线程进行操作 同步快中时睡眠，而不是wait即不会释放锁
+   *
+   * 如果某一段时间内，申请大量的令牌，令牌数超过了本地剩余的令牌数，系统会超前支付一定的令牌数，并且调整下次
+   * 产生令牌的时间，当再有线程申请时，如果没有到时间将会进入睡眠以等待令牌产生，并且计算此处超前支付的数量
+   * 更新下一次nextFreeTickMicros。每次线程都睡眠等待，会一直超前支付，具体可自行假设多个线程请求令牌即可，
+   * 因为线程睡眠前会调用reserveEarliestAvailable,
+   * 又会重新计算nextFreeTicketMicros,当有线程来时会与新的nextFreeTicketMicros比较
+   *
+   *
+   * 比如说，当前一个令牌也没有，resync一下，还没有到nextFreeTicketMicros(时间1),但是可以预先释放令牌，所以计算一下acquire
+   * 令牌所需的时间，添加到还没有到nextFreeTicketMicros(时间2)，目前线程只需要等待到旧的nextFreeTicketMicros(时间1)即可
+   *
+   * 然后第二个线程又来获取一个令牌，resync一下，此时的 nextFreeTicketMicros为时间2,发现还没有到时间2，但是也可以
+   * 预先释放一下，nextFreeTicketMicros变成了时间3，第二个线程只需要等待到时间2即可。
+   *
+   *
+   * 就是后一个线程必须等待到前一个线程获取完令牌的理论时间。
+   *
+   *
+   * @param requiredPermits
+   * @param nowMicros
+   * @return
+   */
   @Override
   final long reserveEarliestAvailable(int requiredPermits, long nowMicros) {
+    // //重新刷新令牌数
     resync(nowMicros);
     long returnValue = nextFreeTicketMicros;
     double storedPermitsToSpend = min(requiredPermits, this.storedPermits);
     double freshPermits = requiredPermits - storedPermitsToSpend;
+    // 为什么要加waitMicros，因为会突然涌入大量请求，而现有令牌数又不够用，因此会预先支付一定的令牌数
+    // waitMicros即是产生预先支付令牌的数量时间，则将下次要添加令牌的时间应该计算时间+watiMicros
     long waitMicros = storedPermitsToWaitTime(this.storedPermits, storedPermitsToSpend)
         + (long) (freshPermits * stableIntervalMicros);
 
@@ -362,6 +390,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
     } catch (ArithmeticException e) {
       this.nextFreeTicketMicros = Long.MAX_VALUE;
     }
+    // //更新令牌数，最低数量为0
     this.storedPermits -= storedPermitsToSpend;
     return returnValue;
   }
