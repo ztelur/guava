@@ -283,6 +283,7 @@ public abstract class RateLimiter {
    */
   final long reserve(int permits) {
     checkPermits(permits);
+    // 获取需要等待的秒数
     synchronized (mutex()) {
       return reserveAndGetWaitLength(permits, stopwatch.readMicros());
     }
@@ -368,6 +369,7 @@ public abstract class RateLimiter {
    * @return the required wait time, never negative
    */
   final long reserveAndGetWaitLength(int permits, long nowMicros) {
+    // 计算permit能够获取到的时刻，然后获取的时刻去减当前时刻，就是等待的时间。
     long momentAvailable = reserveEarliestAvailable(permits, nowMicros);
     return max(momentAvailable - nowMicros, 0);
   }
@@ -383,7 +385,7 @@ public abstract class RateLimiter {
   /**
    * Reserves the requested number of permits and returns the time that those permits can be used
    * (with one caveat).
-   *
+   * 获取permits的数量，并且返回获取这些permits需要花费的时间
    * @return the time that the permits may be used, or, if the permits may be used immediately, an
    *     arbitrary past or present time
    */

@@ -317,6 +317,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
   /**
    * The interval between two unit requests, at our stable rate. E.g., a stable rate of 5 permits
    * per second has a stable interval of 200ms.
+   * 添加令牌时间间隔 = SECONDS.toMicros(1L) / permitsPerSecond；(1秒/每秒的令牌数)
    */
   double stableIntervalMicros;
 
@@ -352,15 +353,20 @@ abstract class SmoothRateLimiter extends RateLimiter {
 
   @Override
   final long reserveEarliestAvailable(int requiredPermits, long nowMicros) {
+    // 每次获取时就会调用resync去更新permits数量
     resync(nowMicros);
     long returnValue = nextFreeTicketMicros;
+    // 计算目前permits是否足够
     double storedPermitsToSpend = min(requiredPermits, this.storedPermits);
+    // 还需要的permits数量
     double freshPermits = requiredPermits - storedPermitsToSpend;
+    // 需要等待的micros, storedPermitsToWaitTime会返回0，然后其实就是permits的差额* 生成一个permit的时间
     long waitMicros =
         storedPermitsToWaitTime(this.storedPermits, storedPermitsToSpend)
             + (long) (freshPermits * stableIntervalMicros);
-
+    // 更新下一次刷新时间,直接相加
     this.nextFreeTicketMicros = LongMath.saturatedAdd(nextFreeTicketMicros, waitMicros);
+    // 减去要获取的permits
     this.storedPermits -= storedPermitsToSpend;
     return returnValue;
   }
@@ -376,15 +382,22 @@ abstract class SmoothRateLimiter extends RateLimiter {
 
   /**
    * Returns the number of microseconds during cool down that we have to wait to get a new permit.
+   * 多长时间产生一个新的令牌
    */
   abstract double coolDownIntervalMicros();
-
+    /**
+     * 基于当前的时间更新storedPermits和nextFreeTicketMicros
+     * 基于当前时间，更新下一次请求令牌的时间，以及当前存储的令牌(可以理解为生成令牌)
+     */
   /** Updates {@code storedPermits} and {@code nextFreeTicketMicros} based on the current time. */
   void resync(long nowMicros) {
     // if nextFreeTicket is in the past, resync to now
     if (nowMicros > nextFreeTicketMicros) {
+        // (当前时间 - 上一次时间) / 产生一个令牌需要的时间
       double newPermits = (nowMicros - nextFreeTicketMicros) / coolDownIntervalMicros();
+      // 生成的令牌数量不能大于maxPermits
       storedPermits = min(maxPermits, storedPermits + newPermits);
+      // 设置下一次更新时间
       nextFreeTicketMicros = nowMicros;
     }
   }
