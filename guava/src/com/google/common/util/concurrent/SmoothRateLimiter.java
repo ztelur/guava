@@ -368,7 +368,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
    *
    * 就是后一个线程必须等待到前一个线程获取完令牌的理论时间。
    *
-   *
+   * 本次请求需要为上次请求的预消费行为埋单，这也是RateLimiter可以预消费(处理突发)的原理所在
    * @param requiredPermits
    * @param nowMicros
    * @return
