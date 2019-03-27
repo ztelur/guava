@@ -153,7 +153,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
    *    cold  +                  /
    * interval |                 /.
    *          |                / .
-   *          |               /  .   <-- "warmup period" is the area of the trapezoid between
+   *          |               /  .   <-- "warmup period" is the area of the trapezoid 梯形 between
    *          |              /   .       thresholdPermits and maxPermits
    *          |             /    .
    *          |            /     .
@@ -162,23 +162,35 @@ abstract class SmoothRateLimiter extends RateLimiter {
    * interval |          .   UP  .
    *          |          . PERIOD.
    *          |          .       .
-   *        0 +----------+-------+--------------> storedPermits
+   *        0 +----------+-------+--------------> storedPermits  存储的令牌数
    *          0 thresholdPermits maxPermits
+   *                  令牌阈值      最大令牌数
+   *
+   *
    * Before going into the details of this particular function, let's keep in mind the basics:
-   * 1) The state of the RateLimiter (storedPermits) is a vertical line in this figure.
+   * 1) The state of the RateLimiter (storedPermits) is a vertical line in this figure. 令牌数是横轴
+   * 当限流器不使用时，令牌数增大，直到maxPermits
    * 2) When the RateLimiter is not used, this goes right (up to maxPermits)
+   * 当限流器使用时，令牌数变小，直到 0
    * 3) When the RateLimiter is used, this goes left (down to zero), since if we have storedPermits,
    *    we serve from those first
+   *
+   *    增加令牌数的比率为maxPermits / warmupPeriod，保证从0到最大的时间为warmupPeriod
    * 4) When _unused_, we go right at a constant rate! The rate at which we move to
    *    the right is chosen as maxPermits / warmupPeriod.  This ensures that the time it takes to
    *    go from 0 to maxPermits is equal to warmupPeriod.
+   *
+   *    当被使用时，需要计算花费k saved permits的时间
    * 5) When _used_, the time it takes, as explained in the introductory class note, is
    *    equal to the integral of our function, between X permits and X-K permits, assuming
    *    we want to spend K saved permits.
    *
+   *    向左移动的时间等于k相关的面积
    *    In summary, the time it takes to move to the left (spend K permits), is equal to the
    *    area of the function of width == K.
    *
+   *    从maxpermits到thresholdPermits的时间也等于warmupPeriod
+   *    从thresholdpermits到0需要warmupPeriod/2
    *    Assuming we have saturated demand, the time to go from maxPermits to thresholdPermits is
    *    equal to warmupPeriod.  And the time to go from thresholdPermits to 0 is
    *    warmupPeriod/2.  (The reason that this is warmupPeriod/2 is to maintain the behavior of
@@ -198,6 +210,9 @@ abstract class SmoothRateLimiter extends RateLimiter {
    *    also equal to warmupPeriod, so
    *
    *        maxPermits = thresholdPermits + 2 * warmupPeriod / (stableInterval + coldInterval).
+   */
+  /**
+   * 平滑预热限流 漏桶算法
    */
   static final class SmoothWarmingUp extends SmoothRateLimiter {
     private final long warmupPeriodMicros;
@@ -219,10 +234,24 @@ abstract class SmoothRateLimiter extends RateLimiter {
     @Override
     void doSetRate(double permitsPerSecond, double stableIntervalMicros) {
       double oldMaxPermits = maxPermits;
+      /**
+       * coldInterval = stable * 比率
+       */
       double coldIntervalMicros = stableIntervalMicros * coldFactor;
+      /**
+       * 阈值 permits = 预热时间 / 稳定产生一个令牌的时间 * 0.5
+       */
       thresholdPermits = 0.5 * warmupPeriodMicros / stableIntervalMicros;
+
+      /**
+       * 最大permits = 阈值 + warmupPeriodMicros / ((stableIntervalMicros + coldIntervalMicros ) / 2)
+       * 使用稳定产生一个令牌的时间间隔和最大产生一个令牌的时间间隔的平均值
+       */
       maxPermits = thresholdPermits
           + 2.0 * warmupPeriodMicros / (stableIntervalMicros + coldIntervalMicros);
+      /**
+       * 计算斜率
+       */
       slope = (coldIntervalMicros - stableIntervalMicros) / (maxPermits - thresholdPermits);
       if (oldMaxPermits == Double.POSITIVE_INFINITY) {
         // if we don't special-case this, we would get storedPermits == NaN, below
@@ -236,27 +265,64 @@ abstract class SmoothRateLimiter extends RateLimiter {
 
     @Override
     long storedPermitsToWaitTime(double storedPermits, double permitsToTake) {
+      /**
+       * 当前permits超出阈值的部分
+       */
       double availablePermitsAboveThreshold = storedPermits - thresholdPermits;
       long micros = 0;
       // measuring the integral on the right part of the function (the climbing line)
+      /**
+       * 如果当前存储的令牌数超出thresholdPermits
+       */
       if (availablePermitsAboveThreshold > 0.0) {
+        /**
+         * 在阈值右侧并且需要被消耗的令牌数量
+         */
         double permitsAboveThresholdToTake = min(availablePermitsAboveThreshold, permitsToTake);
+
+        /**
+         * 梯形的面积
+         *
+         * 高 * (顶 * 底) / 2
+         *
+         * 高是 permitsAboveThresholdToTake 也就是右侧需要消费的令牌数
+         * 底 较长 permitsToTime(availablePermitsAboveThreshold)
+         * 顶 较短 permitsToTime(availablePermitsAboveThreshold - permitsAboveThresholdToTake)
+         */
         micros = (long) (permitsAboveThresholdToTake
             * (permitsToTime(availablePermitsAboveThreshold)
             + permitsToTime(availablePermitsAboveThreshold - permitsAboveThresholdToTake)) / 2.0);
+        /**
+         * 减去已经获取的在阈值右侧的令牌数
+         */
         permitsToTake -= permitsAboveThresholdToTake;
       }
       // measuring the integral on the left part of the function (the horizontal line)
+      /**
+       * 平稳时期的面积，正好是长乘宽
+       */
       micros += (stableIntervalMicros * permitsToTake);
       return micros;
     }
 
+    /**
+     * 横纵坐标转换
+     * @param permits
+     * @return
+     */
     private double permitsToTime(double permits) {
+      /**
+       * 固定值 + 横坐标 * 斜率
+       */
       return stableIntervalMicros + permits * slope;
     }
 
     @Override
     double coolDownIntervalMicros() {
+      /**
+       * 每秒增加的令牌数为 warmup时间/maxPermits. 这样的话，在warmuptime时间内，就就增张的令牌数量
+       * 为 maxPermits
+       */
       return warmupPeriodMicros / maxPermits;
     }
   }
@@ -266,6 +332,18 @@ abstract class SmoothRateLimiter extends RateLimiter {
    * zero throttling. The maximum number of permits that can be saved (when the RateLimiter is
    * unused) is defined in terms of time, in this sense: if a RateLimiter is 2qps, and this
    * time is specified as 10 seconds, we can save up to 2 * 10 = 20 permits.
+   *
+   * 可以处理突发限流，
+   *
+   * 存放固定容量令牌（token）的桶，按照固定速率往桶里添加令牌
+   *
+   *
+   * 令牌按照固定的速率放入，stableIntervalMicros 每xx秒1个
+   * 桶中最多存放b个令牌，当桶满时，新添加的令牌被丢弃或拒绝 maxPermits
+   * 需要n个令牌，如果有则直接放行，否则要消耗时间，但是这个是让第二个进来的人等待。
+   */
+  /**
+   * 令牌桶算法 平滑突发限流
    */
   static final class SmoothBursty extends SmoothRateLimiter {
     /** The work (permits) of how many seconds can be saved up if this RateLimiter is unused? */
@@ -314,6 +392,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
   /**
    * The interval between two unit requests, at our stable rate. E.g., a stable rate of 5 permits
    * per second has a stable interval of 200ms.
+   * 每组请求之前的间隔，比如说如果限流为5 qps,则每个请求需要间隔200ms
    */
   double stableIntervalMicros;
 
@@ -378,10 +457,19 @@ abstract class SmoothRateLimiter extends RateLimiter {
     // //重新刷新令牌数
     resync(nowMicros);
     long returnValue = nextFreeTicketMicros;
+    /**
+     * 获取当前已有的permits和需要的permits中比较小的。
+     */
     double storedPermitsToSpend = min(requiredPermits, this.storedPermits);
+    /**
+     * freshPermits是需要预先支付的令牌，要么为0，要么就是requirePermits - storedPermits
+     */
     double freshPermits = requiredPermits - storedPermitsToSpend;
     // 为什么要加waitMicros，因为会突然涌入大量请求，而现有令牌数又不够用，因此会预先支付一定的令牌数
     // waitMicros即是产生预先支付令牌的数量时间，则将下次要添加令牌的时间应该计算时间+watiMicros
+    /**
+     * storedPermitsToWaitTime + freshPermits * stableIntervalMicros
+     */
     long waitMicros = storedPermitsToWaitTime(this.storedPermits, storedPermitsToSpend)
         + (long) (freshPermits * stableIntervalMicros);
 
@@ -396,6 +484,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
   }
 
   /**
+   * 将要花费的令牌数占令牌总数的比率转变为限流时间。
    * Translates a specified portion of our currently stored permits which we want to
    * spend/acquire, into a throttling time. Conceptually, this evaluates the integral
    * of the underlying function we use, for the range of
@@ -407,6 +496,8 @@ abstract class SmoothRateLimiter extends RateLimiter {
 
   /**
    * Returns the number of microseconds during cool down that we have to wait to get a new permit.
+   *
+   * 返回cool down阶段我们获取一个令牌所需等待的时间
    */
   abstract double coolDownIntervalMicros();
 
